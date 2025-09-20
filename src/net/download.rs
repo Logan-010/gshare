@@ -1,5 +1,5 @@
 use crate::{
-    cli::DownloadOpts,
+    cli::{DownloadOpts, SwarmConfig},
     net::{BOOTSTRAP_URL, Behaviour, BehaviourEvent, PROTOCOL_GSHARE, util},
 };
 use blake3::Hash;
@@ -16,13 +16,13 @@ use std::path::PathBuf;
 use tokio::{fs::File, io::AsyncWriteExt as TokioWrite};
 
 pub async fn task(
-    local: bool,
+    config: SwarmConfig,
     opts: DownloadOpts,
     mut swarm: Swarm<Behaviour>,
 ) -> color_eyre::Result<()> {
     println!("dialing peer");
 
-    if !local {
+    if !config.local {
         swarm.dial(
             Multiaddr::empty()
                 .with(Protocol::Dnsaddr(BOOTSTRAP_URL.into()))
@@ -48,6 +48,8 @@ pub async fn task(
                 peer_id,
                 ..
             })) => {
+                tracing::info!("connected to {}", peer_id);
+
                 if opts
                     .ticket
                     .relay_peer_id
@@ -57,7 +59,7 @@ pub async fn task(
                     println!("connected to {}", peer_id);
                 }
 
-                if local && peer_id == opts.ticket.peer_id {
+                if config.local && peer_id == opts.ticket.peer_id {
                     println!("opening connection to {}", peer_id);
 
                     let stream = swarm
@@ -66,6 +68,8 @@ pub async fn task(
                         .new_control()
                         .open_stream(peer_id, StreamProtocol::new(PROTOCOL_GSHARE))
                         .await?;
+
+                    tracing::info!("handling open stream");
 
                     if let Err(e) = handle(stream, opts.to, opts.ticket.key).await {
                         tracing::error!("failed to handle file download: {}", e);
@@ -80,7 +84,7 @@ pub async fn task(
                     tracing::warn!("dcutr error: {}", e);
                 } else {
                     let id = dcutr.remote_peer_id;
-                    println!("opening connection to {}", id);
+                    println!("opening connection");
 
                     let stream = swarm
                         .behaviour()
@@ -108,23 +112,33 @@ async fn handle(mut stream: Stream, to: Option<PathBuf>, key: [u8; 32]) -> color
     stream.write_all(&key).await?;
     stream.flush().await?;
 
+    tracing::trace!("wrote key");
+
     let mut hash_bytes = [0u8; 32];
     stream.read_exact(&mut hash_bytes).await?;
+
+    tracing::trace!("read hash");
 
     let hash = Hash::from_bytes(hash_bytes);
 
     let mut size_bytes = [0u8; 8];
     stream.read_exact(&mut size_bytes).await?;
 
+    tracing::trace!("read size");
+
     let size = u64::from_be_bytes(size_bytes);
 
     let mut name_length_bytes = [0u8; 8];
     stream.read_exact(&mut name_length_bytes).await?;
 
+    tracing::trace!("read name length");
+
     let name_length = u64::from_be_bytes(name_length_bytes) as usize;
 
     let mut name_bytes = vec![0u8; name_length];
     stream.read_exact(&mut name_bytes).await?;
+
+    tracing::trace!("read name");
 
     let name = String::from_utf8(name_bytes)?;
 
@@ -147,7 +161,6 @@ async fn handle(mut stream: Stream, to: Option<PathBuf>, key: [u8; 32]) -> color
         let read = stream.read(&mut buf).await?;
 
         if read == 0 {
-            bar.finish();
             break;
         }
 
@@ -156,6 +169,8 @@ async fn handle(mut stream: Stream, to: Option<PathBuf>, key: [u8; 32]) -> color
 
         bar.inc(read as u64);
     }
+
+    bar.finish_and_clear();
 
     println!("hashing file");
 

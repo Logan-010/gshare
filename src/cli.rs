@@ -20,7 +20,7 @@ pub struct Cli {
     pub mode: Mode,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 pub struct SwarmConfig {
     /// Enables Ipv6
     #[arg(long, default_value_t = false)]
@@ -37,6 +37,11 @@ pub struct SwarmConfig {
     /// Local discovery only
     #[arg(long)]
     pub local: bool,
+
+    /// Use TCP transport as opposed to (default) QUIC
+    /// * Sometimes TCP is faster in local mode
+    #[arg(long)]
+    pub tcp: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

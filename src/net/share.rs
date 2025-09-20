@@ -1,10 +1,10 @@
 use crate::{
-    cli::{ShareOpts, Ticket},
+    cli::{ShareOpts, SwarmConfig, Ticket},
     net::{BOOTSTRAP_URL, Behaviour, BehaviourEvent, PROTOCOL_GSHARE, util},
 };
 use arboard::Clipboard;
 use color_eyre::eyre::bail;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use libp2p::{
     Multiaddr, Stream, StreamProtocol, Swarm,
     futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
@@ -12,7 +12,7 @@ use libp2p::{
     multiaddr::Protocol,
     swarm::SwarmEvent,
 };
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 use tokio::{
     fs::{self, File},
     io::AsyncReadExt as TokioRead,
@@ -20,7 +20,7 @@ use tokio::{
 };
 
 pub async fn task(
-    local: bool,
+    config: SwarmConfig,
     opts: ShareOpts,
     mut swarm: Swarm<Behaviour>,
 ) -> color_eyre::Result<()> {
@@ -30,33 +30,68 @@ pub async fn task(
         .new_control()
         .accept(StreamProtocol::new(PROTOCOL_GSHARE))?;
 
-    let path = opts.path;
-    let key = rand::random();
+    let path = Arc::new(opts.path);
+    let key = Arc::new(rand::random::<[u8; 32]>());
 
+    let tp = path.clone();
+    let tk = key.clone();
     task::spawn(async move {
-        let path = path.clone();
-        let key = key;
+        let progress = MultiProgress::new();
+
         while let Some((peer, stream)) = incoming.next().await {
-            println!("sending file to {}", peer);
-            if let Err(e) = handle(stream, &path, &key).await {
-                tracing::warn!("failed to serve file: {}", e);
-            }
+            let p = tp.clone();
+            let k = tk.clone();
+
+            let pr = progress.clone();
+
+            tracing::info!("incoming connection from {}", peer);
+            task::spawn(async move {
+                let pb = ProgressBar::no_length();
+                pb.set_style(
+                    ProgressStyle::default_bar()
+                        .template("{spinner} [{elapsed_precise}] [{wide_bar}] {percent_precise} ({bytes_per_sec}, {eta})")
+                        .unwrap()
+                        .progress_chars("#>-"),
+                );
+
+                let progress = pr.add(pb);
+
+                tracing::info!("sending file to {}", peer);
+                if let Err(e) = handle(stream, &p, &k, &progress).await {
+                    progress.finish_and_clear();
+                    progress.force_draw();
+                    pr.remove(&progress);
+
+                    tracing::warn!("failed to serve file: {}", e);
+                } else {
+                    progress.finish_and_clear();
+                    progress.force_draw();
+                    pr.remove(&progress);
+                }
+            });
         }
 
-        tracing::warn!("file handler closed");
+        tracing::error!("file handler closed");
     });
 
-    if !local {
+    if !config.local {
         println!("dialing relay");
         swarm.dial(Multiaddr::empty().with(Protocol::Dnsaddr(BOOTSTRAP_URL.into())))?;
     } else {
         let ticket = Ticket {
             relay_peer_id: None,
             peer_id: *swarm.local_peer_id(),
-            key,
+            key: *key,
         };
 
-        let command = format!("gshare --local download {}", ticket.encode()?);
+        let command = format!(
+            "gshare {}--local download {}",
+            match config.tcp {
+                true => "--tcp ",
+                false => "",
+            },
+            ticket.encode()?
+        );
 
         println!("run:\n\t{}", command);
 
@@ -66,7 +101,7 @@ pub async fn task(
         }
     }
 
-    let mut connected_to_relay = local;
+    let mut connected_to_relay = config.local;
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => tracing::info!("listening on {}", address),
@@ -74,6 +109,8 @@ pub async fn task(
                 peer_id,
                 ..
             })) => {
+                tracing::info!("connected to {}", peer_id);
+
                 if !connected_to_relay {
                     swarm.listen_on(
                         Multiaddr::empty()
@@ -85,10 +122,17 @@ pub async fn task(
                     let ticket = Ticket {
                         relay_peer_id: Some(peer_id),
                         peer_id: *swarm.local_peer_id(),
-                        key,
+                        key: *key,
                     };
 
-                    let command = format!("gshare download {}", ticket.encode()?);
+                    let command = format!(
+                        "gshare {}download {}",
+                        match config.tcp {
+                            true => "--tcp ",
+                            false => "",
+                        },
+                        ticket.encode()?
+                    );
 
                     println!("run:\n\t{}", command);
 
@@ -103,17 +147,24 @@ pub async fn task(
                 tracing::info!("connected to {}", peer_id);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr)) => match dcutr.result {
-                Ok(_) => tracing::info!("connection make to {}", dcutr.remote_peer_id),
-                Err(e) => tracing::warn!("dcutr error: {}", e),
+                Ok(_) => tracing::info!("connection made to {}", dcutr.remote_peer_id),
+                Err(e) => tracing::warn!("hole punch error: {}", e),
             },
             ev => tracing::trace!("{:?}", ev),
         }
     }
 }
 
-async fn handle(mut stream: Stream, path: &Path, key: &[u8; 32]) -> color_eyre::Result<()> {
+async fn handle(
+    mut stream: Stream,
+    path: &Path,
+    key: &[u8; 32],
+    bar: &ProgressBar,
+) -> color_eyre::Result<()> {
     let mut peer_key = [0u8; 32];
     stream.read_exact(&mut peer_key).await?;
+
+    tracing::trace!("read key");
 
     if &peer_key != key {
         bail!("invalid key from peer");
@@ -131,33 +182,32 @@ async fn handle(mut stream: Stream, path: &Path, key: &[u8; 32]) -> color_eyre::
 
     let size = fs::metadata(path).await?.len();
 
+    bar.set_length(size);
+
     stream.write_all(hash.as_bytes()).await?;
     stream.flush().await?;
 
+    tracing::trace!("wrote hash");
+
     stream.write_all(&size.to_be_bytes()).await?;
     stream.flush().await?;
+
+    tracing::trace!("wrote size");
 
     stream.write_all(&(name.len() as u64).to_be_bytes()).await?;
     stream.flush().await?;
     stream.write_all(name.as_bytes()).await?;
     stream.flush().await?;
 
-    let mut file = File::open(path).await?;
+    tracing::trace!("wrote name");
 
-    let bar = ProgressBar::new(size);
-    bar.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner} [{elapsed_precise}] [{wide_bar}] {percent_precise} ({bytes_per_sec}, {eta})")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
+    let mut file = File::open(path).await?;
 
     let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
         let read = file.read(&mut buf).await?;
 
         if read == 0 {
-            bar.finish();
             break;
         }
 

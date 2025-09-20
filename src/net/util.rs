@@ -8,14 +8,14 @@ use libp2p::{
 };
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use tokio::{fs, task};
 
-async fn create_or_load_identity(path: Option<PathBuf>) -> color_eyre::Result<Keypair> {
+async fn create_or_load_identity<P: AsRef<Path>>(path: Option<P>) -> color_eyre::Result<Keypair> {
     match path {
         Some(p) => {
-            if p.exists() {
+            if p.as_ref().exists() {
                 let mut content = fs::read(p).await?;
 
                 let key = ed25519::Keypair::try_from_bytes(&mut content)?;
@@ -34,7 +34,7 @@ async fn create_or_load_identity(path: Option<PathBuf>) -> color_eyre::Result<Ke
 }
 
 pub async fn init_swarm(config: &SwarmConfig) -> color_eyre::Result<Swarm<Behaviour>> {
-    let identity = create_or_load_identity(config.identity.clone()).await?;
+    let identity = create_or_load_identity(config.identity.as_ref()).await?;
 
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
@@ -49,7 +49,9 @@ pub async fn init_swarm(config: &SwarmConfig) -> color_eyre::Result<Swarm<Behavi
         .with_behaviour(|key, relay| Ok(Behaviour::new(key, relay)?))?
         .build();
 
-    if config.local {
+    tracing::info!("local peer id: {}", swarm.local_peer_id());
+
+    if config.tcp {
         swarm.listen_on(
             Multiaddr::empty()
                 .with(match config.ipv6 {
