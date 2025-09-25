@@ -126,7 +126,11 @@ pub async fn task(
                     };
 
                     let command = format!(
-                        "gshare {}download {}",
+                        "gshare {}{}download {}",
+                        match config.ipv4 {
+                            true => "--ipv4 ",
+                            false => "",
+                        },
                         match config.tcp {
                             true => "--tcp ",
                             false => "",

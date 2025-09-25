@@ -22,9 +22,9 @@ pub struct Cli {
 
 #[derive(Parser, Clone)]
 pub struct SwarmConfig {
-    /// Enables Ipv6
+    /// Enables Ipv4 (Local shares are ipv4 only)
     #[arg(long, default_value_t = false)]
-    pub ipv6: bool,
+    pub ipv4: bool,
 
     /// Port to listen on
     #[arg(long, default_value_t = 0)]

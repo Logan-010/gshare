@@ -51,22 +51,22 @@ pub async fn init_swarm(config: &SwarmConfig) -> color_eyre::Result<Swarm<Behavi
 
     tracing::info!("local peer id: {}", swarm.local_peer_id());
 
+    let addr = if config.local || config.ipv4 {
+        Protocol::Ip4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        Protocol::Ip6(Ipv6Addr::UNSPECIFIED)
+    };
+
     if config.tcp {
         swarm.listen_on(
             Multiaddr::empty()
-                .with(match config.ipv6 {
-                    true => Protocol::Ip6(Ipv6Addr::UNSPECIFIED),
-                    false => Protocol::Ip4(Ipv4Addr::UNSPECIFIED),
-                })
+                .with(addr)
                 .with(Protocol::Tcp(config.port)),
         )?;
     } else {
         swarm.listen_on(
             Multiaddr::empty()
-                .with(match config.ipv6 {
-                    true => Protocol::Ip6(Ipv6Addr::UNSPECIFIED),
-                    false => Protocol::Ip4(Ipv4Addr::UNSPECIFIED),
-                })
+                .with(addr)
                 .with(Protocol::Udp(config.port))
                 .with(Protocol::QuicV1),
         )?;
