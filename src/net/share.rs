@@ -1,17 +1,20 @@
 use crate::{
-    cli::{ShareOpts, SwarmConfig, Ticket},
-    net::{BOOTSTRAP_URL, Behaviour, BehaviourEvent, PROTOCOL_GSHARE, util},
+    cli::ShareOpts,
+    net::{Behaviour, BehaviourEvent, PROTOCOL_GSHARE, util, words::WORDS},
 };
 use arboard::Clipboard;
+use blockstore::{Blockstore, InMemoryBlockstore};
+use cid::Cid;
 use color_eyre::eyre::bail;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use libp2p::{
-    Multiaddr, Stream, StreamProtocol, Swarm,
-    futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
-    identify,
-    multiaddr::Protocol,
+    Stream, StreamProtocol, Swarm,
+    futures::{AsyncWriteExt, StreamExt},
+    identify, kad, mdns,
     swarm::SwarmEvent,
 };
+use multihash_codetable::{Code, MultihashDigest};
+use rand::seq::IndexedRandom;
 use std::{path::Path, sync::Arc};
 use tokio::{
     fs::{self, File},
@@ -20,10 +23,12 @@ use tokio::{
 };
 
 pub async fn task(
-    config: SwarmConfig,
     opts: ShareOpts,
     mut swarm: Swarm<Behaviour>,
+    blockstore: Arc<InMemoryBlockstore<64>>,
 ) -> color_eyre::Result<()> {
+    swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
+
     let mut incoming = swarm
         .behaviour()
         .stream
@@ -31,16 +36,13 @@ pub async fn task(
         .accept(StreamProtocol::new(PROTOCOL_GSHARE))?;
 
     let path = Arc::new(opts.path);
-    let key = Arc::new(rand::random::<[u8; 32]>());
 
     let tp = path.clone();
-    let tk = key.clone();
     task::spawn(async move {
         let progress = MultiProgress::new();
 
         while let Some((peer, stream)) = incoming.next().await {
             let p = tp.clone();
-            let k = tk.clone();
 
             let pr = progress.clone();
 
@@ -57,7 +59,7 @@ pub async fn task(
                 let progress = pr.add(pb);
 
                 tracing::info!("sending file to {}", peer);
-                if let Err(e) = handle(stream, &p, &k, &progress).await {
+                if let Err(e) = handle(stream, &p, &progress).await {
                     progress.finish_and_clear();
                     progress.force_draw();
                     pr.remove(&progress);
@@ -74,69 +76,59 @@ pub async fn task(
         tracing::error!("file handler closed");
     });
 
-    if !config.local {
-        println!("dialing relay");
-        swarm.dial(Multiaddr::empty().with(Protocol::Dnsaddr(BOOTSTRAP_URL.into())))?;
-    } else {
-        let ticket = Ticket {
-            relay_peer_id: None,
-            peer_id: *swarm.local_peer_id(),
-            key: *key,
-        };
+    let keycode = WORDS
+        .choose_multiple(&mut rand::rng(), 4)
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("-");
 
-        let command = format!(
-            "gshare {}--local download {}",
-            match config.tcp {
-                true => "--tcp ",
-                false => "",
-            },
-            ticket.encode()?
-        );
+    let code = Code::Sha2_256;
+    let hash = code.digest(keycode.as_bytes());
+    let cid = Cid::new_v1(0x55, hash);
 
-        println!("run:\n\t{}", command);
+    blockstore.put_keyed(&cid, keycode.as_bytes()).await?;
 
-        if opts.copy {
-            Clipboard::new()?.set_text(command)?;
-            println!("copied");
-        }
-    }
+    swarm
+        .behaviour_mut()
+        .kad
+        .start_providing(kad::RecordKey::new(&cid.hash().to_bytes()))?;
 
-    let mut connected_to_relay = config.local;
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => tracing::info!("listening on {}", address),
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
+                info: identify::Info { listen_addrs, .. },
                 ..
             })) => {
-                tracing::info!("connected to {}", peer_id);
+                tracing::trace!("connected to {}", peer_id);
 
-                if !connected_to_relay {
-                    swarm.listen_on(
-                        Multiaddr::empty()
-                            .with(Protocol::Dnsaddr(BOOTSTRAP_URL.into()))
-                            .with(Protocol::P2p(peer_id))
-                            .with(Protocol::P2pCircuit),
-                    )?;
-
-                    let ticket = Ticket {
-                        relay_peer_id: Some(peer_id),
-                        peer_id: *swarm.local_peer_id(),
-                        key: *key,
-                    };
-
-                    let command = format!(
-                        "gshare {}{}download {}",
-                        match config.ipv4 {
-                            true => "--ipv4 ",
-                            false => "",
-                        },
-                        match config.tcp {
-                            true => "--tcp ",
-                            false => "",
-                        },
-                        ticket.encode()?
-                    );
+                for addr in listen_addrs {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                for (peer, address) in list {
+                    tracing::info!("discovered {}", peer);
+                    swarm.behaviour_mut().kad.add_address(&peer, address);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                for (peer, address) in list {
+                    tracing::info!("peer {} expired", peer);
+                    swarm.behaviour_mut().kad.remove_address(&peer, &address);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr)) => match dcutr.result {
+                Ok(_) => tracing::info!("connection made to {}", dcutr.remote_peer_id),
+                Err(e) => tracing::warn!("hole punch error: {}", e),
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                result,
+                ..
+            })) => match result {
+                kad::QueryResult::StartProviding(Ok(_)) => {
+                    let command = format!("gshare download {}", keycode);
 
                     println!("run:\n\t{}", command);
 
@@ -144,36 +136,18 @@ pub async fn task(
                         Clipboard::new()?.set_text(command)?;
                         println!("copied");
                     }
-
-                    connected_to_relay = true;
                 }
-
-                tracing::info!("connected to {}", peer_id);
-            }
-            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr)) => match dcutr.result {
-                Ok(_) => tracing::info!("connection made to {}", dcutr.remote_peer_id),
-                Err(e) => tracing::warn!("hole punch error: {}", e),
+                kad::QueryResult::StartProviding(Err(e)) => {
+                    tracing::error!("failed to provide key: {}", e)
+                }
+                res => tracing::info!("{:?}", res),
             },
             ev => tracing::trace!("{:?}", ev),
         }
     }
 }
 
-async fn handle(
-    mut stream: Stream,
-    path: &Path,
-    key: &[u8; 32],
-    bar: &ProgressBar,
-) -> color_eyre::Result<()> {
-    let mut peer_key = [0u8; 32];
-    stream.read_exact(&mut peer_key).await?;
-
-    tracing::trace!("read key");
-
-    if &peer_key != key {
-        bail!("invalid key from peer");
-    }
-
+async fn handle(mut stream: Stream, path: &Path, bar: &ProgressBar) -> color_eyre::Result<()> {
     let Some(name) = path
         .file_name()
         .and_then(|o| o.to_str())

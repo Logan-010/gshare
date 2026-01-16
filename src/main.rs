@@ -1,11 +1,12 @@
-use clap::Parser;
-use tokio::{select, signal, task};
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-
 mod net;
 
 mod cli;
 use cli::{Cli, Mode};
+
+use clap::Parser;
+use tokio::{select, signal, task};
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -22,12 +23,25 @@ async fn main() -> color_eyre::Result<()> {
         eprintln!("failed to initialize logger");
     }
 
-    let swarm = net::util::init_swarm(&cli.config).await?;
+    let (swarm, blockstore) = net::util::init_swarm().await?;
 
+    let token = CancellationToken::new();
+
+    let t = token.child_token();
     let task = task::spawn(async move {
         match cli.mode {
-            Mode::Share { inner } => net::share::task(cli.config, inner, swarm).await,
-            Mode::Download { inner } => net::download::task(cli.config, inner, swarm).await,
+            Mode::Share { inner } => {
+                select! {
+                    _ = t.cancelled() => Ok(()),
+                    task_res = net::share::task(inner, swarm, blockstore) => task_res
+                }
+            }
+            Mode::Download { inner } => {
+                select! {
+                    _ = t.cancelled() => Ok(()),
+                    task_res = net::download::task(inner, swarm) => task_res
+                }
+            }
         }
     });
 
@@ -39,6 +53,8 @@ async fn main() -> color_eyre::Result<()> {
     }
 
     println!("quitting...");
+
+    token.cancel();
 
     Ok(())
 }

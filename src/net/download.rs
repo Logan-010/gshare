@@ -1,66 +1,65 @@
 use crate::{
-    cli::{DownloadOpts, SwarmConfig},
-    net::{BOOTSTRAP_URL, Behaviour, BehaviourEvent, PROTOCOL_GSHARE, util},
+    cli::DownloadOpts,
+    net::{Behaviour, BehaviourEvent, PROTOCOL_GSHARE, util},
 };
 use blake3::Hash;
-use color_eyre::eyre::{ContextCompat, bail};
+use cid::Cid;
+use color_eyre::eyre::bail;
 use indicatif::{ProgressBar, ProgressStyle};
 use libp2p::{
-    Multiaddr, Stream, StreamProtocol, Swarm,
-    futures::{AsyncReadExt, AsyncWriteExt, StreamExt},
-    identify, mdns,
-    multiaddr::Protocol,
+    PeerId, Stream, StreamProtocol, Swarm,
+    futures::{AsyncReadExt, StreamExt},
+    identify, kad, mdns,
     swarm::SwarmEvent,
 };
-use std::path::PathBuf;
+use multihash_codetable::{Code, MultihashDigest};
+use std::{collections::HashSet, path::PathBuf};
 use tokio::{fs::File, io::AsyncWriteExt as TokioWrite};
 
-pub async fn task(
-    config: SwarmConfig,
-    opts: DownloadOpts,
-    mut swarm: Swarm<Behaviour>,
-) -> color_eyre::Result<()> {
-    println!("dialing peer");
+pub async fn task(opts: DownloadOpts, mut swarm: Swarm<Behaviour>) -> color_eyre::Result<()> {
+    println!("finding peer");
 
-    if !config.local {
-        swarm.dial(
-            Multiaddr::empty()
-                .with(Protocol::Dnsaddr(BOOTSTRAP_URL.into()))
-                .with(Protocol::P2p(
-                    opts.ticket
-                        .relay_peer_id
-                        .context("local ticket for a remote connection")?,
-                ))
-                .with(Protocol::P2pCircuit)
-                .with(Protocol::P2p(opts.ticket.peer_id)),
-        )?;
-    }
+    let code = Code::Sha2_256;
+    let hash = code.digest(opts.code.as_bytes());
+    let cid = Cid::new_v1(0x55, hash);
 
+    swarm
+        .behaviour_mut()
+        .kad
+        .get_providers(kad::RecordKey::new(&cid.hash().to_bytes()));
+
+    let mut target = PeerId::random();
+    let mut local_peers = HashSet::new();
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => tracing::info!("listening on {}", address),
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                for (_, address) in list {
-                    swarm.dial(address)?;
+                for (peer, address) in list {
+                    tracing::info!("discovered peer {}", peer);
+                    local_peers.insert(peer);
+                    swarm.behaviour_mut().kad.add_address(&peer, address);
+                }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                for (peer, address) in list {
+                    tracing::info!("peer {} expired", peer);
+                    local_peers.remove(&peer);
+                    swarm.behaviour_mut().kad.remove_address(&peer, &address);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
+                info: identify::Info { listen_addrs, .. },
                 ..
             })) => {
-                tracing::info!("connected to {}", peer_id);
+                tracing::trace!("connected to {}", peer_id);
 
-                if opts
-                    .ticket
-                    .relay_peer_id
-                    .map(|p| p != peer_id)
-                    .unwrap_or(true)
-                {
-                    println!("connected to {}", peer_id);
+                for addr in listen_addrs {
+                    swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                 }
 
-                if config.local && peer_id == opts.ticket.peer_id {
-                    println!("opening connection to {}", peer_id);
+                if target == peer_id {
+                    println!("opening connection");
 
                     let stream = swarm
                         .behaviour()
@@ -69,9 +68,7 @@ pub async fn task(
                         .open_stream(peer_id, StreamProtocol::new(PROTOCOL_GSHARE))
                         .await?;
 
-                    tracing::info!("handling open stream");
-
-                    if let Err(e) = handle(stream, opts.to, opts.ticket.key).await {
+                    if let Err(e) = handle(stream, opts.to).await {
                         tracing::error!("failed to handle file download: {}", e);
                         return Err(e);
                     }
@@ -79,28 +76,76 @@ pub async fn task(
                     break;
                 }
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr)) => {
-                if let Err(e) = dcutr.result {
-                    tracing::warn!("dcutr error: {}", e);
-                } else {
-                    let id = dcutr.remote_peer_id;
-                    println!("opening connection");
-
-                    let stream = swarm
-                        .behaviour()
-                        .stream
-                        .new_control()
-                        .open_stream(id, StreamProtocol::new(PROTOCOL_GSHARE))
-                        .await?;
-
-                    if let Err(e) = handle(stream, opts.to, opts.ticket.key).await {
-                        tracing::error!("failed to handle file download: {}", e);
-                        return Err(e);
-                    }
-
-                    break;
+            SwarmEvent::Behaviour(BehaviourEvent::Dcutr(dcutr)) => match dcutr.result {
+                Ok(_) => tracing::info!("opened connection to {}", dcutr.remote_peer_id),
+                Err(e) => tracing::warn!(
+                    "failed to hole punch connection to {}, {}",
+                    dcutr.remote_peer_id,
+                    e
+                ),
+            },
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                result,
+                ..
+            })) => match result {
+                kad::QueryResult::GetProviders(Ok(
+                    kad::GetProvidersOk::FinishedWithNoAdditionalRecord { .. },
+                )) => {
+                    tracing::debug!("no providers found");
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .get_providers(kad::RecordKey::new(&cid.hash().to_bytes()));
                 }
-            }
+                kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                    providers,
+                    ..
+                })) => {
+                    if let Some(peer) = providers.iter().next().cloned() {
+                        tracing::info!("found provider {}", peer);
+
+                        target = peer;
+
+                        if swarm.is_connected(&peer) {
+                            println!("opening connection");
+
+                            let stream = swarm
+                                .behaviour()
+                                .stream
+                                .new_control()
+                                .open_stream(peer, StreamProtocol::new(PROTOCOL_GSHARE))
+                                .await?;
+
+                            if let Err(e) = handle(stream, opts.to).await {
+                                tracing::error!("failed to handle file download: {}", e);
+                                return Err(e);
+                            }
+
+                            break;
+                        } else if local_peers.contains(&peer) {
+                            swarm.dial(peer)?;
+                        } else {
+                            swarm.behaviour_mut().kad.get_closest_peers(peer);
+                        }
+                    }
+                }
+                kad::QueryResult::GetProviders(Err(e)) => {
+                    tracing::error!("get providers error {}", e);
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .get_providers(kad::RecordKey::new(&cid.hash().to_bytes()));
+                }
+                kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { peers, .. })) => {
+                    if peers.iter().any(|p| p.peer_id == target) {
+                        swarm.dial(target)?;
+                    }
+                }
+                kad::QueryResult::GetClosestPeers(Err(e)) => {
+                    tracing::error!("failed to get closest peers: {}", e)
+                }
+                res => tracing::debug!("query result: {:?}", res),
+            },
             ev => tracing::trace!("{:?}", ev),
         }
     }
@@ -108,12 +153,7 @@ pub async fn task(
     Ok(())
 }
 
-async fn handle(mut stream: Stream, to: Option<PathBuf>, key: [u8; 32]) -> color_eyre::Result<()> {
-    stream.write_all(&key).await?;
-    stream.flush().await?;
-
-    tracing::trace!("wrote key");
-
+async fn handle(mut stream: Stream, to: Option<PathBuf>) -> color_eyre::Result<()> {
     let mut hash_bytes = [0u8; 32];
     stream.read_exact(&mut hash_bytes).await?;
 

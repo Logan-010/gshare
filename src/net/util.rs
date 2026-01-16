@@ -1,42 +1,18 @@
-use crate::{cli::SwarmConfig, net::Behaviour};
+use crate::net::{BOOTNODES, BOOTSTRAP_URL, Behaviour};
 use blake3::{Hash, Hasher};
-use libp2p::{
-    Multiaddr, Swarm, SwarmBuilder,
-    identity::{Keypair, ed25519},
-    multiaddr::Protocol,
-    noise, tcp, yamux,
-};
+use blockstore::InMemoryBlockstore;
+use libp2p::{Multiaddr, PeerId, Swarm, SwarmBuilder, multiaddr::Protocol, noise, tcp, yamux};
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
-    path::{Path, PathBuf},
+    path::PathBuf,
+    sync::Arc,
 };
-use tokio::{fs, task};
+use tokio::task;
 
-async fn create_or_load_identity<P: AsRef<Path>>(path: Option<P>) -> color_eyre::Result<Keypair> {
-    match path {
-        Some(p) => {
-            if p.as_ref().exists() {
-                let mut content = fs::read(p).await?;
+pub async fn init_swarm() -> color_eyre::Result<(Swarm<Behaviour>, Arc<InMemoryBlockstore<64>>)> {
+    let blockstore = Arc::new(InMemoryBlockstore::new());
 
-                let key = ed25519::Keypair::try_from_bytes(&mut content)?;
-
-                Ok(Keypair::from(key))
-            } else {
-                let key = ed25519::Keypair::generate();
-
-                fs::write(p, &key.to_bytes()).await?;
-
-                Ok(Keypair::from(key))
-            }
-        }
-        None => Ok(Keypair::generate_ed25519()),
-    }
-}
-
-pub async fn init_swarm(config: &SwarmConfig) -> color_eyre::Result<Swarm<Behaviour>> {
-    let identity = create_or_load_identity(config.identity.as_ref()).await?;
-
-    let mut swarm = SwarmBuilder::with_existing_identity(identity)
+    let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
             tcp::Config::new().nodelay(true),
@@ -46,33 +22,45 @@ pub async fn init_swarm(config: &SwarmConfig) -> color_eyre::Result<Swarm<Behavi
         .with_quic()
         .with_dns()?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
-        .with_behaviour(|key, relay| Ok(Behaviour::new(key, relay)?))?
+        .with_behaviour(|key, relay| Ok(Behaviour::new(key, relay, blockstore.clone())?))?
         .build();
 
     tracing::info!("local peer id: {}", swarm.local_peer_id());
 
-    let addr = if config.local || config.ipv4 {
-        Protocol::Ip4(Ipv4Addr::UNSPECIFIED)
-    } else {
-        Protocol::Ip6(Ipv6Addr::UNSPECIFIED)
-    };
+    for peer in BOOTNODES {
+        let id = peer.parse::<PeerId>().unwrap();
 
-    if config.tcp {
-        swarm.listen_on(
-            Multiaddr::empty()
-                .with(addr)
-                .with(Protocol::Tcp(config.port)),
-        )?;
-    } else {
-        swarm.listen_on(
-            Multiaddr::empty()
-                .with(addr)
-                .with(Protocol::Udp(config.port))
-                .with(Protocol::QuicV1),
-        )?;
+        let addr = Multiaddr::empty().with(Protocol::Dnsaddr(BOOTSTRAP_URL.into()));
+
+        swarm.behaviour_mut().kad.add_address(&id, addr.clone());
+
+        swarm.listen_on(addr.with(Protocol::P2p(id)).with(Protocol::P2pCircuit))?;
     }
 
-    Ok(swarm)
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(0)),
+    )?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::Ip6(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Tcp(0)),
+    )?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::Ip4(Ipv4Addr::UNSPECIFIED))
+            .with(Protocol::Udp(0))
+            .with(Protocol::QuicV1),
+    )?;
+    swarm.listen_on(
+        Multiaddr::empty()
+            .with(Protocol::Ip6(Ipv6Addr::UNSPECIFIED))
+            .with(Protocol::Udp(0))
+            .with(Protocol::QuicV1),
+    )?;
+
+    Ok((swarm, blockstore))
 }
 
 pub async fn hash_file(path: PathBuf) -> color_eyre::Result<Hash> {
