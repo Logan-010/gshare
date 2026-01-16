@@ -49,10 +49,12 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
 [profile.release]
-codegen-units = 1
-lto = "fat"
 opt-level = "z"
+lto = "fat"
+codegen-units = 1
 panic = "abort"
-strip = "symbols"
-incremental = false
+strip = true
 debug = false
+incremental = false
+rpath = false
+overflow-checks = false
